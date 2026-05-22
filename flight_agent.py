@@ -45,8 +45,10 @@ AIRPORT_CACHE_PATH = SCRIPT_DIR / "airport_cache.json"
 
 # Default targets the `sky-scrapper3` listing on RapidAPI (host: sky-scrapper3.p.rapidapi.com).
 # Override at runtime with RAPIDAPI_HOST=<host> if you subscribe to a different fork.
+# Note: sky-scrapper3 exposes BOTH endpoints under /api/v1/. The apiheya fork uses /api/v2/
+# for searchFlights; if you ever swap back, also flip the path below.
 RAPIDAPI_HOST = os.environ.get("RAPIDAPI_HOST", "sky-scrapper3.p.rapidapi.com").strip()
-SEARCH_FLIGHTS_URL = f"https://{RAPIDAPI_HOST}/api/v2/flights/searchFlights"
+SEARCH_FLIGHTS_URL = f"https://{RAPIDAPI_HOST}/api/v1/flights/searchFlights"
 SEARCH_AIRPORT_URL = f"https://{RAPIDAPI_HOST}/api/v1/flights/searchAirport"
 
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
@@ -188,8 +190,31 @@ def _save_airport_cache(cache: dict[str, dict[str, str]]) -> None:
     AIRPORT_CACHE_PATH.write_text(json.dumps(cache, indent=2))
 
 
+def _pluck_airport_ids(item: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Extract (skyId, entityId) from a searchAirport result item.
+
+    sky-scrapper3 returns them flat on the item; apiheya's sky-scrapper nests
+    them under `navigation.relevantFlightParams`. Try both shapes.
+    """
+    sky_id = item.get("skyId")
+    entity_id = item.get("entityId")
+    if not (sky_id and entity_id):
+        nav = item.get("navigation", {}) or {}
+        fp = nav.get("relevantFlightParams", {}) or {}
+        sky_id = sky_id or fp.get("skyId")
+        entity_id = entity_id or fp.get("entityId")
+    return (sky_id, str(entity_id) if entity_id is not None else None)
+
+
+def _is_airport_item(item: dict[str, Any]) -> bool:
+    """Some vendors flag entity type; others don't. Be lenient."""
+    nav = item.get("navigation", {}) or {}
+    et = (nav.get("entityType") or item.get("entityType") or "").upper()
+    return et in ("", "AIRPORT")  # accept blank (sky-scrapper3 omits it) or AIRPORT
+
+
 def resolve_airport(iata: str, key: str, cache: dict[str, dict[str, str]]) -> dict[str, str] | None:
-    """Sky-scrapper requires its own skyId/entityId pair, not raw IATA codes."""
+    """Map a raw IATA code to the vendor's skyId/entityId pair, with caching."""
     iata = iata.upper()
     if iata in cache:
         return cache[iata]
@@ -198,33 +223,33 @@ def resolve_airport(iata: str, key: str, cache: dict[str, dict[str, str]]) -> di
         r = requests.get(
             SEARCH_AIRPORT_URL,
             headers=_rapidapi_headers(key),
-            params={"query": iata, "locale": "en-US"},
+            params={"query": iata},
             timeout=20,
         )
         r.raise_for_status()
-        data = r.json().get("data", [])
+        data = r.json().get("data", []) or []
+
+        # Pass 1: exact skyId match
         for item in data:
-            nav = item.get("navigation", {})
-            entity_type = nav.get("entityType", "").upper()
-            if entity_type != "AIRPORT":
+            if not _is_airport_item(item):
                 continue
-            flight_params = nav.get("relevantFlightParams", {})
-            sky_id = flight_params.get("skyId") or item.get("skyId")
-            entity_id = flight_params.get("entityId") or item.get("entityId")
-            if sky_id and sky_id.upper() == iata:
-                cache[iata] = {"skyId": sky_id, "entityId": str(entity_id)}
+            sky_id, entity_id = _pluck_airport_ids(item)
+            if sky_id and sky_id.upper() == iata and entity_id:
+                cache[iata] = {"skyId": sky_id, "entityId": entity_id}
                 _save_airport_cache(cache)
                 return cache[iata]
-        # fallback to first AIRPORT result if exact skyId didn't match
+
+        # Pass 2: first usable AIRPORT-like result
         for item in data:
-            nav = item.get("navigation", {})
-            if nav.get("entityType", "").upper() != "AIRPORT":
+            if not _is_airport_item(item):
                 continue
-            fp = nav.get("relevantFlightParams", {})
-            if fp.get("skyId") and fp.get("entityId"):
-                cache[iata] = {"skyId": fp["skyId"], "entityId": str(fp["entityId"])}
+            sky_id, entity_id = _pluck_airport_ids(item)
+            if sky_id and entity_id:
+                cache[iata] = {"skyId": sky_id, "entityId": entity_id}
                 _save_airport_cache(cache)
                 return cache[iata]
+
+        log.warning("no airport match for %s in %d results", iata, len(data))
     except requests.RequestException as e:
         log.warning("resolve_airport %s failed: %s", iata, e)
     return None
