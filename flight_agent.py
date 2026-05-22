@@ -43,12 +43,12 @@ CONFIG_PATH = SCRIPT_DIR / "config.yaml"
 STATE_PATH = SCRIPT_DIR / "state.json"
 AIRPORT_CACHE_PATH = SCRIPT_DIR / "airport_cache.json"
 
-# Default targets the `sky-scrapper3` listing on RapidAPI (host: sky-scrapper3.p.rapidapi.com).
-# Override at runtime with RAPIDAPI_HOST=<host> if you subscribe to a different fork.
-# Note: sky-scrapper3 exposes BOTH endpoints under /api/v1/. The apiheya fork uses /api/v2/
-# for searchFlights; if you ever swap back, also flip the path below.
-RAPIDAPI_HOST = os.environ.get("RAPIDAPI_HOST", "sky-scrapper3.p.rapidapi.com").strip()
-SEARCH_FLIGHTS_URL = f"https://{RAPIDAPI_HOST}/api/v1/flights/searchFlights"
+# Default targets apiheya's Sky Scrapper listing (host: sky-scrapper.p.rapidapi.com).
+# Override at runtime with RAPIDAPI_HOST=<host> if you subscribe to a different fork —
+# but be aware different forks use different paths (e.g. sky-scrapper3 puts searchFlights
+# under /api/v1/, apiheya puts it under /api/v2/) and may require code changes too.
+RAPIDAPI_HOST = os.environ.get("RAPIDAPI_HOST", "sky-scrapper.p.rapidapi.com").strip()
+SEARCH_FLIGHTS_URL = f"https://{RAPIDAPI_HOST}/api/v2/flights/searchFlights"
 SEARCH_AIRPORT_URL = f"https://{RAPIDAPI_HOST}/api/v1/flights/searchAirport"
 
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
