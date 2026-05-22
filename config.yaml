@@ -11,22 +11,54 @@ cabin_class: economy         # economy | premium_economy | business | first
 adults: 1
 
 # Each destination gets its own price ceiling.
-# The hard filter drops anything above max_price_usd before the LLM ever sees it,
-# so set these to roughly the "this would be a real deal" threshold for each route.
+# The hard filter drops anything above max_price_usd before the LLM ever sees it.
+#
+# NOTE: All ceilings are temporarily set to $1500 for an end-to-end live test
+# so the LLM and Telegram pipeline get exercised. Re-tighten per route after
+# the first successful run (see commit history for prior tighter values).
 destinations:
-  - code: LON
-    max_price_usd: 250
-  - code: PAR
-    max_price_usd: 250
-  - code: BCN
-    max_price_usd: 220
-  - code: ROM
-    max_price_usd: 220
-  - code: ATH
-    max_price_usd: 180
-  - code: BKK
-    max_price_usd: 550
-  - code: TYO
-    max_price_usd: 700
-  - code: NYC
-    max_price_usd: 600
+  # --- existing destinations (kept per request) ---
+  - { code: LON, max_price_usd: 1500 }   # London (UK)
+  - { code: PAR, max_price_usd: 1500 }   # Paris (France)
+  - { code: BCN, max_price_usd: 1500 }   # Barcelona (Spain)
+  - { code: ROM, max_price_usd: 1500 }   # Rome (Italy)
+  - { code: ATH, max_price_usd: 1500 }   # Athens (Greece)
+  - { code: BKK, max_price_usd: 1500 }   # Bangkok (Thailand)
+  - { code: TYO, max_price_usd: 1500 }   # Tokyo (Japan)
+  - { code: NYC, max_price_usd: 1500 }   # New York (USA)
+
+  # --- expanded European hubs/cities ---
+  # Western Europe
+  - { code: AMS, max_price_usd: 1500 }   # Amsterdam (Netherlands)
+  - { code: BRU, max_price_usd: 1500 }   # Brussels (Belgium)
+  - { code: DUB, max_price_usd: 1500 }   # Dublin (Ireland)
+  - { code: LIS, max_price_usd: 1500 }   # Lisbon (Portugal)
+  - { code: MAD, max_price_usd: 1500 }   # Madrid (Spain)
+  - { code: NCE, max_price_usd: 1500 }   # Nice (France)
+
+  # Central Europe & DACH
+  - { code: BER, max_price_usd: 1500 }   # Berlin (Germany)
+  - { code: FRA, max_price_usd: 1500 }   # Frankfurt (Germany)
+  - { code: MUC, max_price_usd: 1500 }   # Munich (Germany)
+  - { code: VIE, max_price_usd: 1500 }   # Vienna (Austria)
+  - { code: ZRH, max_price_usd: 1500 }   # Zurich (Switzerland)
+  - { code: GVA, max_price_usd: 1500 }   # Geneva (Switzerland)
+  - { code: PRG, max_price_usd: 1500 }   # Prague (Czech Republic)
+
+  # Eastern Europe
+  - { code: WAW, max_price_usd: 1500 }   # Warsaw (Poland)
+  - { code: BUD, max_price_usd: 1500 }   # Budapest (Hungary)
+  - { code: OTP, max_price_usd: 1500 }   # Bucharest (Romania)
+  - { code: SOF, max_price_usd: 1500 }   # Sofia (Bulgaria)
+
+  # Southern Europe
+  - { code: MIL, max_price_usd: 1500 }   # Milan (Italy)
+
+  # Nordics
+  - { code: CPH, max_price_usd: 1500 }   # Copenhagen (Denmark)
+  - { code: ARN, max_price_usd: 1500 }   # Stockholm (Sweden)
+  - { code: OSL, max_price_usd: 1500 }   # Oslo (Norway)
+  - { code: HEL, max_price_usd: 1500 }   # Helsinki (Finland)
+
+  # Major hub on the Europe/Asia bridge (Turkey accepts Israeli passport holders)
+  - { code: IST, max_price_usd: 1500 }   # Istanbul (Turkey)
