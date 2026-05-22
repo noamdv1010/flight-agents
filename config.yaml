@@ -1,0 +1,32 @@
+# Flight Agent — watchlist configuration
+# Edit this file to tune what the agent hunts for.
+
+origin: TLV                  # IATA code of home airport
+currency: USD
+min_score: 8                 # only alert when LLM scores deal >= this (1-10)
+trip_length_days: [4, 14]    # min, max trip length the scanner will sample
+date_window_days: 120        # how far out (days) to scan departures
+samples_per_destination: 6   # number of (depart,return) pairs to sample per dest per run
+cabin_class: economy         # economy | premium_economy | business | first
+adults: 1
+
+# Each destination gets its own price ceiling.
+# The hard filter drops anything above max_price_usd before the LLM ever sees it,
+# so set these to roughly the "this would be a real deal" threshold for each route.
+destinations:
+  - code: LON
+    max_price_usd: 250
+  - code: PAR
+    max_price_usd: 250
+  - code: BCN
+    max_price_usd: 220
+  - code: ROM
+    max_price_usd: 220
+  - code: ATH
+    max_price_usd: 180
+  - code: BKK
+    max_price_usd: 550
+  - code: TYO
+    max_price_usd: 700
+  - code: NYC
+    max_price_usd: 600
