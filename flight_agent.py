@@ -244,8 +244,12 @@ def parse_duration_minutes(raw: str) -> int:
 
 
 def _google_flights_deep_link(origin: str, destination: str, depart: str, return_: str) -> str:
-    """Build a Google Flights search URL that opens to the same query."""
-    q = f"Flights from {origin} to {destination} on {depart} returning {return_}"
+    """Build a Google Flights deep-link that opens directly to this itinerary.
+
+    Uses the format Google Flights itself uses when sharing a search:
+      https://www.google.com/travel/flights?q=Flights+to+{DST}+from+{ORI}+on+{DATE}+through+{DATE}
+    """
+    q = f"Flights to {destination} from {origin} on {depart} through {return_}"
     return f"https://www.google.com/travel/flights?q={quote_plus(q)}"
 
 
@@ -360,6 +364,8 @@ def sample_date_pairs(cfg: Config, seed_salt: str) -> list[tuple[str, str]]:
         d2 = d1 + timedelta(days=trip)
         if d2 > latest:
             continue
+        if (d2 - d1).days < 2:          # hard floor: must be at least 2 nights
+            continue
         key = (d1.isoformat(), d2.isoformat())
         if key in seen:
             continue
@@ -373,29 +379,25 @@ def sample_date_pairs(cfg: Config, seed_salt: str) -> list[tuple[str, str]]:
 # ---------------------------------------------------------------------------
 
 
-SCORING_SYSTEM = """You are a meticulous flight deal evaluator. You rate round-trip
-itineraries on a 1-10 scale where:
+SCORING_SYSTEM = """אתה מעריך עסקאות טיסה מדוקדק. אתה מדרג כרטיסי טיסה הלוך-חזור בסקלה של 1-10:
 
-  10 = mistake fare or extraordinary deal; book within the hour
-   9 = excellent deal, well below typical, comfortable schedule
-   8 = clearly good deal worth alerting the user about
-   7 = decent price but with friction (very long layover, awkward times, weak carrier)
-   1-6 = not worth interrupting the user
+  10 = טעות מחיר או עסקה יוצאת דופן — להזמין תוך שעה
+   9 = עסקה מצוינת, נמוכה משמעותית מהרגיל, לוח זמנים נוח
+   8 = עסקה טובה בבירור שכדאי להתריע עליה
+   7 = מחיר סביר אך עם חיכוך (עצירה ארוכה, שעות מסורבלות, חברה חלשה)
+   1-6 = לא שווה להפריע למשתמש
 
-You weigh these factors:
-  * Price vs. a reasonable baseline for the route and season (most weight)
-  * Outbound flight duration (data source only gives one direction)
-  * Number of stops on the outbound; non-stop is a strong positive
-  * Carrier reputation — major full-service carriers and reputable LCCs are fine;
-    obscure no-name carriers should drag the score down
-  * Trip length matching what a real traveler would want
+אתה שוקל את הגורמים הבאים:
+  * מחיר מול בסיס סביר לנתיב ולעונה — המשקל הגדול ביותר
+  * משך הטיסה היוצאת (מקור הנתונים נותן רק כיוון אחד)
+  * מספר עצירות בטיסה היוצאת — טיסה ישירה היא יתרון חזק
+  * מוניטין חברת התעופה — חברות ראשיות ו-LCC מכובדות בסדר; חברות לא מוכרות מורידות את הציון
+  * אורך הנסיעה המתאים לנוסע אמיתי
 
-Some fields may be marked "unknown" (the data source doesn't expose layover
-times or the inbound leg). Do not penalize for missing fields; just lean
-harder on the fields you do have, especially price and stops.
+חלק מהשדות עשויים להיות "לא ידוע". אל תעניש על שדות חסרים; הסתמך יותר על השדות הקיימים, בעיקר מחיר ועצירות.
 
-Be strict: most fares should NOT score 8+. Reserve high scores for genuine deals.
-Return ONLY through the `record_deal_score` tool. Keep reasoning under 200 chars."""
+היה קפדן: רוב המחירים לא אמורים לקבל ציון 8+. שמור ציונים גבוהים לעסקאות אמיתיות.
+החזר תשובה אך ורק דרך הכלי `record_deal_score`. כתוב את שדה reasoning בעברית בלבד, עד 200 תווים."""
 
 
 SCORING_TOOL = {
@@ -413,7 +415,7 @@ SCORING_TOOL = {
             "reasoning": {
                 "type": "string",
                 "maxLength": 220,
-                "description": "One-sentence rationale that names the dominant factors.",
+                "description": "משפט אחד בעברית המסביר את הגורמים המרכזיים לדירוג.",
             },
         },
         "required": ["score", "reasoning"],
@@ -498,30 +500,38 @@ def send_telegram(cfg: Config, text: str) -> None:
 
 
 def format_alert(deal: FlightDeal, score: int, reasoning: str) -> str:
-    """Build an HTML-formatted Telegram message. All dynamic strings are escaped."""
+    """Build an HTML-formatted Telegram message in Hebrew. All dynamic strings are escaped."""
     def fmt_dur(m: int) -> str:
-        return "unknown" if m < 0 else f"{m // 60}h{m % 60:02d}m"
+        return "לא ידוע" if m < 0 else f"{m // 60}ש׳ {m % 60:02d}ד׳"
 
-    stops_parts = []
-    if deal.stops_outbound >= 0:
-        stops_parts.append(f"{deal.stops_outbound} out")
-    if deal.stops_inbound >= 0:
-        stops_parts.append(f"{deal.stops_inbound} ret")
-    stops = ", ".join(stops_parts) if stops_parts else "stops unknown"
+    if deal.stops_outbound < 0:
+        stops_str = "לא ידוע"
+    elif deal.stops_outbound == 0:
+        stops_str = "ישירה ✅"
+    else:
+        stops_str = f"{deal.stops_outbound} עצירות"
 
-    carriers = ", ".join(deal.carriers[:3]) or "unknown"
+    carriers = ", ".join(deal.carriers[:3]) or "לא ידוע"
+
+    # Score badge: 10 = 🔥, 9 = ⭐⭐, 8 = ⭐
+    if score == 10:
+        badge = "🔥🔥🔥"
+    elif score == 9:
+        badge = "⭐⭐"
+    else:
+        badge = "⭐"
 
     e = html.escape  # all user/api-controlled strings flow through this
     return (
-        f"<b>Gold Deal {score}/10</b> — {e(deal.origin)} → {e(deal.destination)}\n\n"
-        f"<b>Price:</b> ${deal.price_usd:.0f}\n"
-        f"<b>Dates:</b> {e(deal.depart_date)} → {e(deal.return_date)} "
-        f"({deal.trip_length()}n)\n"
-        f"<b>Outbound flight:</b> {fmt_dur(deal.total_duration_minutes)}, "
-        f"stops: {stops}\n"
-        f"<b>Carriers:</b> {e(carriers)}\n\n"
-        f"<i>{e(reasoning)}</i>\n\n"
-        f'<a href="{e(deal.deep_link, quote=True)}">Open on Google Flights</a>'
+        f"✈️ <b>דיל מטורף {badge} — {score}/10</b>\n"
+        f"📍 {e(deal.origin)} ← → {e(deal.destination)}\n\n"
+        f"💰 <b>מחיר הלוך-חזור:</b> <b>${deal.price_usd:.0f}</b>\n"
+        f"📅 <b>יציאה:</b> {e(deal.depart_date)}\n"
+        f"🔄 <b>חזרה:</b> {e(deal.return_date)} ({deal.trip_length()} לילות)\n"
+        f"⏱ <b>משך טיסה:</b> {fmt_dur(deal.total_duration_minutes)} | {stops_str}\n"
+        f"🛫 <b>חברת תעופה:</b> {e(carriers)}\n\n"
+        f"💬 <i>{e(reasoning)}</i>\n\n"
+        f'🔗 <a href="{e(deal.deep_link, quote=True)}">פתח בגוגל פלייטס</a>'
     )
 
 
@@ -597,7 +607,7 @@ def force_alert(cfg: Config) -> None:
         carriers=["Test Air"],
         deep_link="https://example.com",
     )
-    send_telegram(cfg, format_alert(fake, 10, "End-to-end test ping from flight_agent.py."))
+    send_telegram(cfg, format_alert(fake, 10, "בדיקת קצה לקצה — הודעת טסט מ-flight_agent.py."))
     log.info("synthetic alert sent.")
 
 
