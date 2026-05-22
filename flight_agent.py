@@ -43,7 +43,9 @@ CONFIG_PATH = SCRIPT_DIR / "config.yaml"
 STATE_PATH = SCRIPT_DIR / "state.json"
 AIRPORT_CACHE_PATH = SCRIPT_DIR / "airport_cache.json"
 
-RAPIDAPI_HOST = "sky-scrapper.p.rapidapi.com"
+# Default targets the `sky-scrapper3` listing on RapidAPI (host: sky-scrapper3.p.rapidapi.com).
+# Override at runtime with RAPIDAPI_HOST=<host> if you subscribe to a different fork.
+RAPIDAPI_HOST = os.environ.get("RAPIDAPI_HOST", "sky-scrapper3.p.rapidapi.com").strip()
 SEARCH_FLIGHTS_URL = f"https://{RAPIDAPI_HOST}/api/v2/flights/searchFlights"
 SEARCH_AIRPORT_URL = f"https://{RAPIDAPI_HOST}/api/v1/flights/searchAirport"
 
