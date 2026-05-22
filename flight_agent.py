@@ -531,7 +531,9 @@ def format_alert(deal: FlightDeal, score: int, reasoning: str) -> str:
         f"⏱ <b>משך טיסה:</b> {fmt_dur(deal.total_duration_minutes)} | {stops_str}\n"
         f"🛫 <b>חברת תעופה:</b> {e(carriers)}\n\n"
         f"💬 <i>{e(reasoning)}</i>\n\n"
-        f'🔗 <a href="{e(deal.deep_link, quote=True)}">פתח בגוגל פלייטס</a>'
+        f'🔗 <a href="{e(deal.deep_link, quote=True)}">פתח בגוגל פלייטס</a>\n\n'
+        f"⚠️ <i>שים לב: המחיר הינו לכרטיס בסיסי (תיק גב/טרולי). "
+        f"בחברות לואו-קוסט תיתכן תוספת עבור מזוודה גדולה.</i>"
     )
 
 
