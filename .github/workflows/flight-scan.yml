@@ -29,7 +29,6 @@ jobs:
 
       - name: Run flight agent
         env:
-          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}

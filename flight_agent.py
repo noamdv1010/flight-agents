@@ -2,7 +2,7 @@
 
 Pipeline (per run):
     config.yaml + secrets
-        -> Skyscanner (sky-scrapper @ RapidAPI) per destination & date sample
+        -> fast-flights (Google Flights, no API key) per destination & date sample
         -> normalize -> hard price filter -> dedupe against state.json
         -> Claude Haiku 4.5 scores each survivor (1-10) via tool-use JSON
         -> Telegram alert for any score >= min_score
@@ -23,16 +23,19 @@ import json
 import logging
 import os
 import random
+import re
 import sys
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote_plus
 
 import requests
 import yaml
 from anthropic import Anthropic
+from fast_flights import FlightData, Passengers, get_flights
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -41,15 +44,40 @@ from anthropic import Anthropic
 SCRIPT_DIR = Path(__file__).parent.resolve()
 CONFIG_PATH = SCRIPT_DIR / "config.yaml"
 STATE_PATH = SCRIPT_DIR / "state.json"
-AIRPORT_CACHE_PATH = SCRIPT_DIR / "airport_cache.json"
 
-# Default targets apiheya's Sky Scrapper listing (host: sky-scrapper.p.rapidapi.com).
-# Override at runtime with RAPIDAPI_HOST=<host> if you subscribe to a different fork —
-# but be aware different forks use different paths (e.g. sky-scrapper3 puts searchFlights
-# under /api/v1/, apiheya puts it under /api/v2/) and may require code changes too.
-RAPIDAPI_HOST = os.environ.get("RAPIDAPI_HOST", "sky-scrapper.p.rapidapi.com").strip()
-SEARCH_FLIGHTS_URL = f"https://{RAPIDAPI_HOST}/api/v2/flights/searchFlights"
-SEARCH_AIRPORT_URL = f"https://{RAPIDAPI_HOST}/api/v1/flights/searchAirport"
+# fast-flights fetch mode:
+#   "common"         - direct HTTP, parses Google's protobuf response (default, fastest)
+#   "fallback"       - tries common first, falls back to try.playwright.tech if empty.
+#                      That fallback now requires a paid token, so prefer "common".
+#   "force-fallback" - skips common entirely; needs a try.playwright.tech token.
+#   "local"          - runs Playwright locally; reliable but heavy.
+FETCH_MODE = os.environ.get("FAST_FLIGHTS_MODE", "common").strip()
+
+# Google Flights returns prices in the locale's currency based on the source IP.
+# These are approximate USD conversion rates for filtering against the user's
+# USD-denominated ceilings. ±5% is fine for mistake-fare triage; users who care
+# about exactness can override via the `fx_rates` block in config.yaml.
+FX_TO_USD_DEFAULTS: dict[str, float] = {
+    "$": 1.0,
+    "US$": 1.0,
+    "USD": 1.0,
+    "€": 1.07,
+    "EUR": 1.07,
+    "£": 1.27,
+    "GBP": 1.27,
+    "₪": 0.27,
+    "ILS": 0.27,
+    "¥": 0.0067,
+    "JPY": 0.0067,
+    "₩": 0.00073,
+    "KRW": 0.00073,
+    "₹": 0.012,
+    "INR": 0.012,
+    "C$": 0.73,
+    "CAD": 0.73,
+    "A$": 0.66,
+    "AUD": 0.66,
+}
 
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 STATE_TTL_DAYS = 14
@@ -105,9 +133,9 @@ class Config:
     cabin_class: str
     adults: int
     destinations: list[dict[str, Any]] = field(default_factory=list)
+    fx_rates: dict[str, float] = field(default_factory=dict)
 
     # Secrets
-    rapidapi_key: str = ""
     anthropic_key: str = ""
     telegram_token: str = ""
     telegram_chat_id: str = ""
@@ -129,6 +157,9 @@ def load_config() -> Config:
             sys.exit(f"missing required env var: {name}")
         return val
 
+    fx_rates = dict(FX_TO_USD_DEFAULTS)
+    fx_rates.update(raw.get("fx_rates", {}) or {})
+
     return Config(
         origin=raw["origin"],
         currency=raw.get("currency", "USD"),
@@ -139,7 +170,7 @@ def load_config() -> Config:
         cabin_class=raw.get("cabin_class", "economy"),
         adults=int(raw.get("adults", 1)),
         destinations=raw["destinations"],
-        rapidapi_key=need_env("RAPIDAPI_KEY"),
+        fx_rates=fx_rates,
         anthropic_key=need_env("ANTHROPIC_API_KEY"),
         telegram_token=need_env("TELEGRAM_BOT_TOKEN"),
         telegram_chat_id=need_env("TELEGRAM_CHAT_ID"),
@@ -169,205 +200,131 @@ def prune_state(state: dict[str, str]) -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Sky-scrapper integration
+# Google Flights via fast-flights (no API key, no quota — but ToS-grey and
+# subject to break when Google rotates their internal protobuf)
 # ---------------------------------------------------------------------------
 
 
-def _rapidapi_headers(key: str) -> dict[str, str]:
-    return {"x-rapidapi-key": key, "x-rapidapi-host": RAPIDAPI_HOST}
+_DURATION_RE_HR = re.compile(r"(\d+)\s*hr", re.IGNORECASE)
+_DURATION_RE_MIN = re.compile(r"(\d+)\s*min", re.IGNORECASE)
 
 
-def _load_airport_cache() -> dict[str, dict[str, str]]:
-    if AIRPORT_CACHE_PATH.exists():
-        try:
-            return json.loads(AIRPORT_CACHE_PATH.read_text())
-        except json.JSONDecodeError:
-            pass
-    return {}
+def parse_price(raw: str, fx_rates: dict[str, float]) -> float:
+    """Convert a fast-flights price string (locale-dependent) into USD.
 
-
-def _save_airport_cache(cache: dict[str, dict[str, str]]) -> None:
-    AIRPORT_CACHE_PATH.write_text(json.dumps(cache, indent=2))
-
-
-def _pluck_airport_ids(item: dict[str, Any]) -> tuple[str | None, str | None]:
-    """Extract (skyId, entityId) from a searchAirport result item.
-
-    sky-scrapper3 returns them flat on the item; apiheya's sky-scrapper nests
-    them under `navigation.relevantFlightParams`. Try both shapes.
+    Examples: '$249' -> 249.0, '₪1868' -> ~504, '€350' -> ~374.5
+    Returns 0.0 if the string can't be parsed.
     """
-    sky_id = item.get("skyId")
-    entity_id = item.get("entityId")
-    if not (sky_id and entity_id):
-        nav = item.get("navigation", {}) or {}
-        fp = nav.get("relevantFlightParams", {}) or {}
-        sky_id = sky_id or fp.get("skyId")
-        entity_id = entity_id or fp.get("entityId")
-    return (sky_id, str(entity_id) if entity_id is not None else None)
-
-
-def _is_airport_item(item: dict[str, Any]) -> bool:
-    """Some vendors flag entity type; others don't. Be lenient."""
-    nav = item.get("navigation", {}) or {}
-    et = (nav.get("entityType") or item.get("entityType") or "").upper()
-    return et in ("", "AIRPORT")  # accept blank (sky-scrapper3 omits it) or AIRPORT
-
-
-def resolve_airport(iata: str, key: str, cache: dict[str, dict[str, str]]) -> dict[str, str] | None:
-    """Map a raw IATA code to the vendor's skyId/entityId pair, with caching."""
-    iata = iata.upper()
-    if iata in cache:
-        return cache[iata]
-
+    if not raw:
+        return 0.0
+    s = raw.strip()
+    # Longest-match so 'US$' wins over '$'.
+    symbol = next(
+        (k for k in sorted(fx_rates, key=len, reverse=True) if k in s),
+        None,
+    )
+    digits = re.sub(r"[^\d.]", "", s)
+    if not digits:
+        return 0.0
     try:
-        r = requests.get(
-            SEARCH_AIRPORT_URL,
-            headers=_rapidapi_headers(key),
-            params={"query": iata},
-            timeout=20,
-        )
-        r.raise_for_status()
-        data = r.json().get("data", []) or []
+        amount = float(digits)
+    except ValueError:
+        return 0.0
+    rate = fx_rates.get(symbol, 1.0) if symbol else 1.0
+    return amount * rate
 
-        # Pass 1: exact skyId match
-        for item in data:
-            if not _is_airport_item(item):
-                continue
-            sky_id, entity_id = _pluck_airport_ids(item)
-            if sky_id and sky_id.upper() == iata and entity_id:
-                cache[iata] = {"skyId": sky_id, "entityId": entity_id}
-                _save_airport_cache(cache)
-                return cache[iata]
 
-        # Pass 2: first usable AIRPORT-like result
-        for item in data:
-            if not _is_airport_item(item):
-                continue
-            sky_id, entity_id = _pluck_airport_ids(item)
-            if sky_id and entity_id:
-                cache[iata] = {"skyId": sky_id, "entityId": entity_id}
-                _save_airport_cache(cache)
-                return cache[iata]
+def parse_duration_minutes(raw: str) -> int:
+    """Parse human strings like '8 hr 15 min' or '45 min' into minutes."""
+    if not raw:
+        return 0
+    h = _DURATION_RE_HR.search(raw)
+    m = _DURATION_RE_MIN.search(raw)
+    return (int(h.group(1)) if h else 0) * 60 + (int(m.group(1)) if m else 0)
 
-        log.warning("no airport match for %s in %d results", iata, len(data))
-    except requests.RequestException as e:
-        log.warning("resolve_airport %s failed: %s", iata, e)
-    return None
+
+def _google_flights_deep_link(origin: str, destination: str, depart: str, return_: str) -> str:
+    """Build a Google Flights search URL that opens to the same query."""
+    q = f"Flights from {origin} to {destination} on {depart} returning {return_}"
+    return f"https://www.google.com/travel/flights?q={quote_plus(q)}"
+
+
+def _call_fast_flights(cfg: Config, origin: str, destination: str, depart: str, return_: str):
+    return get_flights(
+        flight_data=[
+            FlightData(date=depart, from_airport=origin, to_airport=destination),
+            FlightData(date=return_, from_airport=destination, to_airport=origin),
+        ],
+        trip="round-trip",
+        seat=cfg.cabin_class,
+        passengers=Passengers(adults=cfg.adults),
+        fetch_mode=FETCH_MODE,
+    )
 
 
 def search_flights(
     cfg: Config,
-    origin_air: dict[str, str],
-    dest_air: dict[str, str],
-    depart: str,
-    return_: str,
-) -> list[dict[str, Any]] | None:
-    params = {
-        "originSkyId": origin_air["skyId"],
-        "destinationSkyId": dest_air["skyId"],
-        "originEntityId": origin_air["entityId"],
-        "destinationEntityId": dest_air["entityId"],
-        "date": depart,
-        "returnDate": return_,
-        "cabinClass": cfg.cabin_class,
-        "adults": str(cfg.adults),
-        "sortBy": "best",
-        "currency": cfg.currency,
-        "market": "en-US",
-        "countryCode": "US",
-    }
-
-    for attempt in (1, 2):
-        try:
-            r = requests.get(
-                SEARCH_FLIGHTS_URL,
-                headers=_rapidapi_headers(cfg.rapidapi_key),
-                params=params,
-                timeout=30,
-            )
-            if r.status_code in (429, 500, 502, 503, 504) and attempt == 1:
-                log.warning("rapidapi %s, retrying once", r.status_code)
-                time.sleep(3)
-                continue
-            r.raise_for_status()
-            payload = r.json()
-            if not payload.get("status"):
-                log.warning("sky-scrapper soft-fail: %s", payload.get("message"))
-                return None
-            return payload.get("data", {}).get("itineraries", []) or []
-        except requests.RequestException as e:
-            if attempt == 2:
-                log.warning("search_flights %s->%s failed: %s",
-                            origin_air["skyId"], dest_air["skyId"], e)
-                return None
-            time.sleep(3)
-    return None
-
-
-def normalize(
-    itineraries: list[dict[str, Any]],
     origin: str,
     destination: str,
     depart: str,
     return_: str,
-    cabin: str,
 ) -> list[FlightDeal]:
-    deals: list[FlightDeal] = []
-    for it in itineraries:
+    """Call fast-flights for one round-trip and normalize directly into FlightDeal.
+
+    fast-flights returns a list of outbound options, each carrying the cheapest
+    full round-trip price available with that outbound. The response has no
+    inbound or layover detail, so we set those fields to sentinel values (-1)
+    and the scoring prompt tells Claude to treat them as 'unknown'.
+
+    Google occasionally returns an unrendered loading-page (0 flights). We
+    retry once after a short pause; if it still comes back empty, we accept it.
+    """
+    result = None
+    for attempt in (1, 2):
         try:
-            price = float(it.get("price", {}).get("raw", 0))
-            if price <= 0:
+            result = _call_fast_flights(cfg, origin, destination, depart, return_)
+            if result.flights:
+                break
+            log.info("empty result %s->%s %s/%s (attempt %d)",
+                     origin, destination, depart, return_, attempt)
+        except Exception as e:
+            # Truncate noisy HTML error pages so the log stays readable.
+            msg = str(e).splitlines()[0][:200]
+            log.warning("fast-flights %s->%s %s/%s attempt %d failed: %s",
+                        origin, destination, depart, return_, attempt, msg)
+        if attempt == 1:
+            time.sleep(6.0)
+
+    if not result or not result.flights:
+        return []
+
+    deals: list[FlightDeal] = []
+    deep_link = _google_flights_deep_link(origin, destination, depart, return_)
+    for f in result.flights or []:
+        try:
+            price_usd = parse_price(f.price, cfg.fx_rates)
+            if price_usd <= 0:
                 continue
-            legs = it.get("legs", [])
-            if len(legs) < 2:
-                continue  # expecting round-trip
-            out_leg, in_leg = legs[0], legs[1]
-            total_dur = int(out_leg.get("durationInMinutes", 0)) + int(in_leg.get("durationInMinutes", 0))
-
-            def max_layover(leg: dict[str, Any]) -> int:
-                segments = leg.get("segments", [])
-                if len(segments) < 2:
-                    return 0
-                gaps = []
-                for a, b in zip(segments, segments[1:]):
-                    try:
-                        t1 = datetime.fromisoformat(a["arrival"])
-                        t2 = datetime.fromisoformat(b["departure"])
-                        gaps.append(int((t2 - t1).total_seconds() // 60))
-                    except (KeyError, ValueError):
-                        continue
-                return max(gaps) if gaps else 0
-
-            layover = max(max_layover(out_leg), max_layover(in_leg))
-
-            carriers = set()
-            for leg in legs:
-                for c in leg.get("carriers", {}).get("marketing", []):
-                    if c.get("name"):
-                        carriers.add(c["name"])
-
-            deep_link = (
-                f"https://www.skyscanner.net/transport/flights/"
-                f"{origin.lower()}/{destination.lower()}/"
-                f"{depart.replace('-', '')[2:]}/{return_.replace('-', '')[2:]}/"
-            )
-
+            outbound_min = parse_duration_minutes(f.duration)
+            stops = int(f.stops or 0)
             deals.append(FlightDeal(
                 origin=origin,
                 destination=destination,
                 depart_date=depart,
                 return_date=return_,
-                price_usd=price,
-                total_duration_minutes=total_dur,
-                stops_outbound=int(out_leg.get("stopCount", 0)),
-                stops_inbound=int(in_leg.get("stopCount", 0)),
-                layover_minutes=layover,
-                carriers=sorted(carriers),
+                price_usd=price_usd,
+                # Only outbound duration is available from fast-flights; the
+                # scoring prompt mentions this so Claude doesn't double-count.
+                total_duration_minutes=outbound_min,
+                stops_outbound=stops,
+                stops_inbound=-1,        # sentinel: unknown
+                layover_minutes=-1,      # sentinel: unknown
+                carriers=[f.name] if f.name else [],
                 deep_link=deep_link,
-                cabin_class=cabin,
+                cabin_class=cfg.cabin_class,
             ))
-        except (KeyError, TypeError, ValueError) as e:
-            log.debug("skipping malformed itinerary: %s", e)
+        except (AttributeError, TypeError, ValueError) as e:
+            log.debug("skipping malformed flight: %s", e)
             continue
     return deals
 
@@ -426,13 +383,16 @@ itineraries on a 1-10 scale where:
    1-6 = not worth interrupting the user
 
 You weigh these factors:
-  * Price vs. a reasonable baseline for the route and season
-  * Total trip duration (each-way travel time)
-  * Number of stops; non-stop is a strong positive
-  * Longest single layover (anything > 5h is friction, > 10h is bad)
+  * Price vs. a reasonable baseline for the route and season (most weight)
+  * Outbound flight duration (data source only gives one direction)
+  * Number of stops on the outbound; non-stop is a strong positive
   * Carrier reputation — major full-service carriers and reputable LCCs are fine;
     obscure no-name carriers should drag the score down
   * Trip length matching what a real traveler would want
+
+Some fields may be marked "unknown" (the data source doesn't expose layover
+times or the inbound leg). Do not penalize for missing fields; just lean
+harder on the fields you do have, especially price and stops.
 
 Be strict: most fares should NOT score 8+. Reserve high scores for genuine deals.
 Return ONLY through the `record_deal_score` tool. Keep reasoning under 200 chars."""
@@ -466,15 +426,20 @@ def score_deal(
     deal: FlightDeal,
     max_price_for_route: float,
 ) -> tuple[int, str]:
+    def fmt_min(m: int) -> str:
+        return "unknown" if m < 0 else f"{m // 60}h {m % 60}m"
+
+    def fmt_stops(s: int) -> str:
+        return "unknown" if s < 0 else str(s)
+
     user_msg = (
         f"Route: {deal.origin} <-> {deal.destination}\n"
         f"Dates: {deal.depart_date} to {deal.return_date} ({deal.trip_length()} nights)\n"
         f"Price: ${deal.price_usd:.0f} USD (user's alert ceiling for this route: ${max_price_for_route:.0f})\n"
         f"Cabin: {deal.cabin_class}\n"
-        f"Total travel time (both directions combined): "
-        f"{deal.total_duration_minutes // 60}h {deal.total_duration_minutes % 60}m\n"
-        f"Stops: outbound={deal.stops_outbound}, inbound={deal.stops_inbound}\n"
-        f"Longest single layover: {deal.layover_minutes // 60}h {deal.layover_minutes % 60}m\n"
+        f"Outbound flight duration: {fmt_min(deal.total_duration_minutes)}\n"
+        f"Stops: outbound={fmt_stops(deal.stops_outbound)}, inbound={fmt_stops(deal.stops_inbound)}\n"
+        f"Longest single layover: {fmt_min(deal.layover_minutes)}\n"
         f"Carriers: {', '.join(deal.carriers) or 'unknown'}\n\n"
         f"Score this deal."
     )
@@ -534,11 +499,16 @@ def send_telegram(cfg: Config, text: str) -> None:
 
 def format_alert(deal: FlightDeal, score: int, reasoning: str) -> str:
     """Build an HTML-formatted Telegram message. All dynamic strings are escaped."""
-    hrs = deal.total_duration_minutes // 60
-    mins = deal.total_duration_minutes % 60
-    lay_h = deal.layover_minutes // 60
-    lay_m = deal.layover_minutes % 60
-    stops = f"{deal.stops_outbound}+{deal.stops_inbound} stops"
+    def fmt_dur(m: int) -> str:
+        return "unknown" if m < 0 else f"{m // 60}h{m % 60:02d}m"
+
+    stops_parts = []
+    if deal.stops_outbound >= 0:
+        stops_parts.append(f"{deal.stops_outbound} out")
+    if deal.stops_inbound >= 0:
+        stops_parts.append(f"{deal.stops_inbound} ret")
+    stops = ", ".join(stops_parts) if stops_parts else "stops unknown"
+
     carriers = ", ".join(deal.carriers[:3]) or "unknown"
 
     e = html.escape  # all user/api-controlled strings flow through this
@@ -547,11 +517,11 @@ def format_alert(deal: FlightDeal, score: int, reasoning: str) -> str:
         f"<b>Price:</b> ${deal.price_usd:.0f}\n"
         f"<b>Dates:</b> {e(deal.depart_date)} → {e(deal.return_date)} "
         f"({deal.trip_length()}n)\n"
-        f"<b>Travel time:</b> {hrs}h{mins:02d}m total, {stops}, "
-        f"longest layover {lay_h}h{lay_m:02d}m\n"
+        f"<b>Outbound flight:</b> {fmt_dur(deal.total_duration_minutes)}, "
+        f"stops: {stops}\n"
         f"<b>Carriers:</b> {e(carriers)}\n\n"
         f"<i>{e(reasoning)}</i>\n\n"
-        f'<a href="{e(deal.deep_link, quote=True)}">Open on Skyscanner</a>'
+        f'<a href="{e(deal.deep_link, quote=True)}">Open on Google Flights</a>'
     )
 
 
@@ -563,11 +533,6 @@ def format_alert(deal: FlightDeal, score: int, reasoning: str) -> str:
 def run(cfg: Config, dry_run: bool) -> None:
     client = Anthropic(api_key=cfg.anthropic_key)
     state = prune_state(load_state())
-    airport_cache = _load_airport_cache()
-
-    origin_air = resolve_airport(cfg.origin, cfg.rapidapi_key, airport_cache)
-    if not origin_air:
-        sys.exit(f"could not resolve origin airport {cfg.origin}")
 
     total_seen = 0
     total_alerted = 0
@@ -577,17 +542,9 @@ def run(cfg: Config, dry_run: bool) -> None:
         max_price = float(dest_cfg["max_price_usd"])
         log.info("=== %s -> %s (ceiling $%.0f) ===", cfg.origin, dest_code, max_price)
 
-        dest_air = resolve_airport(dest_code, cfg.rapidapi_key, airport_cache)
-        if not dest_air:
-            log.warning("could not resolve %s, skipping", dest_code)
-            continue
-
         candidates: list[FlightDeal] = []
         for depart, return_ in sample_date_pairs(cfg, seed_salt=dest_code):
-            itins = search_flights(cfg, origin_air, dest_air, depart, return_)
-            if itins is None:
-                continue
-            deals = normalize(itins, cfg.origin, dest_code, depart, return_, cfg.cabin_class)
+            deals = search_flights(cfg, cfg.origin, dest_code, depart, return_)
             total_seen += len(deals)
             for deal in deals:
                 if deal.price_usd > max_price:
@@ -596,7 +553,8 @@ def run(cfg: Config, dry_run: bool) -> None:
                     log.info("  skip already-alerted %s $%.0f", deal.depart_date, deal.price_usd)
                     continue
                 candidates.append(deal)
-            time.sleep(1.0)  # gentle pacing for RapidAPI
+            # Pacing — Google can rate-limit aggressive scraping.
+            time.sleep(2.0)
 
         if not candidates:
             log.info("  no candidates under ceiling")
@@ -634,8 +592,8 @@ def force_alert(cfg: Config) -> None:
         price_usd=99.0,
         total_duration_minutes=600,
         stops_outbound=0,
-        stops_inbound=0,
-        layover_minutes=0,
+        stops_inbound=-1,
+        layover_minutes=-1,
         carriers=["Test Air"],
         deep_link="https://example.com",
     )

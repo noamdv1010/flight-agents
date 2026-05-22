@@ -1,22 +1,28 @@
 # Flight Agent
 
 Autonomous mistake-fare hunter. Runs on GitHub Actions every 4 hours, scans
-your watchlist via Skyscanner (sky-scrapper on RapidAPI), has Claude Haiku 4.5
-score each candidate, and pings Telegram when a deal scores >= 8/10.
+your watchlist via Google Flights (via the `fast-flights` library — no API key,
+no quota), has Claude Haiku 4.5 score each candidate, and pings Telegram when a
+deal scores >= 8/10.
 
 ## Cost
 
-- GitHub Actions: free (job runs ~2 min, well under the 2,000 min/mo private quota)
+- GitHub Actions: free (job runs ~3 min, well under the 2,000 min/mo private quota)
 - Telegram: free
-- RapidAPI (`sky-scrapper`): free tier is ~50 requests/mo; BASIC tier $10/mo gives 500. Tune `samples_per_destination` and cron frequency to fit.
+- Google Flights: free (no API key — `fast-flights` calls Google's internal endpoints)
 - Anthropic Haiku 4.5: ~$0.50–$2/mo at default settings
 
-## 1. Get your API keys
+## Heads up about the data source
 
-### RapidAPI key
-1. Sign up at https://rapidapi.com
-2. Subscribe to the **Sky Scrapper** API by `apiheya` (search "sky-scrapper")
-3. Copy the `X-RapidAPI-Key` from the dashboard
+`fast-flights` scrapes Google Flights' internal protobuf API. It's:
+- **Free and quota-less** — main reason for the choice.
+- **Sits in ToS-grey territory.** Fine for personal-scale use; don't deploy this for a business.
+- **Breaks every few months** when Google rotates their schema. When that happens, `pip install --upgrade fast-flights` usually fixes it.
+- **More likely to be rate-limited from cloud IPs** (like GitHub Actions). The default `FAST_FLIGHTS_MODE=fallback` routes through the library's hosted proxy to help.
+
+If reliability matters more than zero-cost, swap to **Travelpayouts** (1000 req/day free, real API) or **Amadeus Self-Service** (2000/mo free, official airline data).
+
+## 1. Get your API keys
 
 ### Anthropic key
 1. https://console.anthropic.com → Settings → API Keys → Create Key
@@ -49,7 +55,7 @@ A formatted message should arrive in Telegram within a couple of seconds.
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env        # fill in all four keys
+cp .env.example .env        # fill in the three keys
 set -a; source .env; set +a
 python flight_agent.py --dry-run   # scans real data, prints what would alert, no Telegram, no state writes
 ```
@@ -64,8 +70,7 @@ python flight_agent.py --dry-run   # scans real data, prints what would alert, n
    git remote add origin git@github.com:<you>/flight-agents.git
    git push -u origin main
    ```
-3. In the repo: **Settings → Secrets and variables → Actions → New repository secret**. Add all four:
-   - `RAPIDAPI_KEY`
+3. In the repo: **Settings → Secrets and variables → Actions → New repository secret**. Add all three:
    - `ANTHROPIC_API_KEY`
    - `TELEGRAM_BOT_TOKEN`
    - `TELEGRAM_CHAT_ID`
@@ -77,9 +82,10 @@ python flight_agent.py --dry-run   # scans real data, prints what would alert, n
 Edit `config.yaml`:
 - `destinations` / `max_price_usd`: your watchlist and the price threshold that marks a "deal" for that route
 - `min_score`: raise to 9 for fewer/better alerts, lower to 7 for more noise
-- `samples_per_destination`: each sample = 1 RapidAPI call. Lower this if you're on the free tier
+- `samples_per_destination`: each sample = 1 fast-flights call. Pacing is ~2s between calls.
 - `date_window_days`: how far out to scan
 - `trip_length_days`: e.g. `[3, 5]` for weekend trips, `[10, 21]` for longer holidays
+- `fx_rates` (optional): override the built-in currency conversion table if Google Flights returns prices in a currency you want to convert more accurately
 
 To change cadence, edit the cron in `.github/workflows/flight-scan.yml`.
 
@@ -89,3 +95,12 @@ Each alerted itinerary is hashed (origin + destination + dates + price bucketed
 to nearest $10) and stored in `state.json` for 14 days. So you won't get
 re-pinged about the same deal on every run — but a real price drop of more than
 ~$10 will re-trigger.
+
+## When fast-flights breaks
+
+If the workflow starts logging `fast-flights ... failed: ...` errors:
+
+1. `pip install --upgrade fast-flights` locally and check if a new version is available.
+2. Bump `fast-flights>=X.Y` in `requirements.txt` and push.
+3. If the library hasn't been updated, try `FAST_FLIGHTS_MODE=common` (direct requests) or `local` (Playwright, heavier).
+4. Worst case: swap data sources. The `search_flights()` function in `flight_agent.py` is the only place you'd need to change.
