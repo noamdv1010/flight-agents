@@ -177,26 +177,75 @@ def load_config() -> Config:
     )
 
 
-def load_state() -> dict[str, str]:
+def load_state() -> dict[str, dict[str, Any]]:
+    """Load state.json. Migrates legacy string-only entries into the rich
+    dict-shape used by the relative-scoring logic.
+
+    New entry shape:
+        {
+          "alerted_at": "<ISO timestamp>",
+          "route": "TLV-ATH",
+          "price_usd": 220.0,
+          "score": 8,
+          "depart_date": "2026-08-15",
+          "return_date": "2026-08-22"
+        }
+    """
     if not STATE_PATH.exists():
         return {}
     try:
-        return json.loads(STATE_PATH.read_text())
+        raw = json.loads(STATE_PATH.read_text())
     except json.JSONDecodeError:
         log.warning("state.json corrupt, starting fresh")
         return {}
+    migrated: dict[str, dict[str, Any]] = {}
+    for k, v in raw.items():
+        if isinstance(v, str):
+            # legacy entry: just the timestamp, no route/price/score history.
+            migrated[k] = {"alerted_at": v}
+        elif isinstance(v, dict) and "alerted_at" in v:
+            migrated[k] = v
+        # silently drop anything malformed
+    return migrated
 
 
-def save_state(state: dict[str, str]) -> None:
-    STATE_PATH.write_text(json.dumps(state, indent=2, sort_keys=True))
+def save_state(state: dict[str, dict[str, Any]]) -> None:
+    STATE_PATH.write_text(json.dumps(state, indent=2, sort_keys=True, ensure_ascii=False))
 
 
-def prune_state(state: dict[str, str]) -> dict[str, str]:
+def prune_state(state: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
     cutoff = datetime.now(timezone.utc) - timedelta(days=STATE_TTL_DAYS)
-    return {
-        k: v for k, v in state.items()
-        if datetime.fromisoformat(v) > cutoff
-    }
+    out: dict[str, dict[str, Any]] = {}
+    for k, v in state.items():
+        ts = v.get("alerted_at")
+        if not ts:
+            continue
+        try:
+            if datetime.fromisoformat(ts) > cutoff:
+                out[k] = v
+        except ValueError:
+            continue
+    return out
+
+
+def recent_alerts_for_route(
+    state: dict[str, dict[str, Any]],
+    origin: str,
+    destination: str,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    """Return up to `limit` recent alerts for this exact route, cheapest first.
+
+    Used to give the LLM a baseline so it can score new deals *relatively*
+    against what has already been alerted on, instead of in isolation.
+    """
+    route = f"{origin}-{destination}"
+    matches = [
+        v for v in state.values()
+        if v.get("route") == route and "price_usd" in v
+    ]
+    matches.sort(key=lambda x: float(x.get("price_usd", 9e9)))
+    return matches[:limit]
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +445,15 @@ SCORING_SYSTEM = """אתה מעריך עסקאות טיסה מדוקדק. אתה
 
 חלק מהשדות עשויים להיות "לא ידוע". אל תעניש על שדות חסרים; הסתמך יותר על השדות הקיימים, בעיקר מחיר ועצירות.
 
+** דירוג יחסי להיסטוריה — חשוב מאוד: **
+אם מוצגת לך "היסטוריית התראות אחרונות לנתיב הזה", השתמש בה כקו בסיס:
+  * דיל חדש באותו טווח מחיר (±5%) של דיל שכבר התרענו עליו → מקסימום 7
+  * דיל יקר יותר מהדיל הזול ביותר בהיסטוריה → מקסימום 7
+  * דיל זול ב-10%-20% מהזול ביותר בהיסטוריה → ראוי לציון 8
+  * דיל זול ב-20%-35% מהזול ביותר בהיסטוריה → ציון 9
+  * דיל זול ב-35%+ מהזול ביותר בהיסטוריה או טעות מחיר ברורה → ציון 10
+המטרה: לא להציף את המשתמש שוב ושוב באותו דיל. אם כבר התרענו על אתונה ב-$220, דיל חדש באתונה ב-$215 לא ראוי להתראה — רק מחיר נמוך משמעותית מצדיק זאת.
+
 היה קפדן: רוב המחירים לא אמורים לקבל ציון 8+. שמור ציונים גבוהים לעסקאות אמיתיות.
 החזר תשובה אך ורק דרך הכלי `record_deal_score`. כתוב את שדה reasoning בעברית בלבד, עד 200 תווים."""
 
@@ -427,12 +485,30 @@ def score_deal(
     client: Anthropic,
     deal: FlightDeal,
     max_price_for_route: float,
+    recent_alerts: list[dict[str, Any]] | None = None,
 ) -> tuple[int, str]:
     def fmt_min(m: int) -> str:
         return "unknown" if m < 0 else f"{m // 60}h {m % 60}m"
 
     def fmt_stops(s: int) -> str:
         return "unknown" if s < 0 else str(s)
+
+    # Render history so the LLM scores this deal relative to past alerts, not in isolation.
+    history_block = ""
+    if recent_alerts:
+        lines = ["", "היסטוריית התראות אחרונות לנתיב הזה (14 ימים אחרונים, מסודר מהזול ליקר):"]
+        for a in recent_alerts:
+            price = a.get("price_usd", 0)
+            sc = a.get("score", "?")
+            dep = a.get("depart_date", "?")
+            ret = a.get("return_date", "?")
+            lines.append(f"  - ${price:.0f} (ציון {sc}/10), {dep} → {ret}")
+        cheapest = min(float(a.get("price_usd", 9e9)) for a in recent_alerts)
+        lines.append(
+            f"\nהמחיר הזול ביותר שכבר התרענו עליו: ${cheapest:.0f}. "
+            f"דרג את הדיל החדש ביחס לקו הבסיס הזה לפי הכללים בסיסטם פרומפט."
+        )
+        history_block = "\n".join(lines) + "\n"
 
     user_msg = (
         f"Route: {deal.origin} <-> {deal.destination}\n"
@@ -442,7 +518,8 @@ def score_deal(
         f"Outbound flight duration: {fmt_min(deal.total_duration_minutes)}\n"
         f"Stops: outbound={fmt_stops(deal.stops_outbound)}, inbound={fmt_stops(deal.stops_inbound)}\n"
         f"Longest single layover: {fmt_min(deal.layover_minutes)}\n"
-        f"Carriers: {', '.join(deal.carriers) or 'unknown'}\n\n"
+        f"Carriers: {', '.join(deal.carriers) or 'unknown'}\n"
+        f"{history_block}\n"
         f"Score this deal."
     )
 
@@ -572,11 +649,18 @@ def run(cfg: Config, dry_run: bool) -> None:
             log.info("  no candidates under ceiling")
             continue
 
-        # Score only the cheapest few per destination to control LLM cost
+        # Score only the cheapest few per destination to control LLM cost.
+        # Pull the recent-alert history for this route ONCE and feed it into
+        # every scoring call so the LLM can compare against the existing baseline.
+        history = recent_alerts_for_route(state, cfg.origin, dest_code)
+        if history:
+            log.info("  history for %s: %d recent alerts (cheapest $%.0f)",
+                     dest_code, len(history), min(a["price_usd"] for a in history))
+
         candidates.sort(key=lambda d: d.price_usd)
         for deal in candidates[:3]:
             try:
-                score, reasoning = score_deal(client, deal, max_price)
+                score, reasoning = score_deal(client, deal, max_price, recent_alerts=history)
             except Exception as e:
                 log.warning("scoring failed for %s %s: %s", dest_code, deal.depart_date, e)
                 continue
@@ -588,7 +672,17 @@ def run(cfg: Config, dry_run: bool) -> None:
                     log.info("  [DRY-RUN] would alert:\n%s", msg)
                 else:
                     send_telegram(cfg, msg)
-                state[deal.fingerprint()] = datetime.now(timezone.utc).isoformat()
+                state[deal.fingerprint()] = {
+                    "alerted_at": datetime.now(timezone.utc).isoformat(),
+                    "route": f"{deal.origin}-{deal.destination}",
+                    "price_usd": round(deal.price_usd, 2),
+                    "score": score,
+                    "depart_date": deal.depart_date,
+                    "return_date": deal.return_date,
+                }
+                # Future deals in THIS same run for the same destination should
+                # also see this alert as part of their baseline.
+                history = recent_alerts_for_route(state, cfg.origin, dest_code)
                 total_alerted += 1
 
     save_state(state)
