@@ -52,6 +52,14 @@
     "route": "TLV-ROM",
     "score": 8
   },
+  "3d8000a374d5bdee": {
+    "alerted_at": "2026-05-27T21:43:54.848441+00:00",
+    "depart_date": "2026-06-30",
+    "price_usd": 206.0,
+    "return_date": "2026-07-06",
+    "route": "TLV-ATH",
+    "score": 8
+  },
   "3db3d3d178b677e1": {
     "alerted_at": "2026-05-22T22:05:09.803723+00:00"
   },
