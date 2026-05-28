@@ -5,6 +5,14 @@
   "035de2085bfdd4de": {
     "alerted_at": "2026-05-22T22:03:43.012967+00:00"
   },
+  "099feaa069190bda": {
+    "alerted_at": "2026-05-28T01:51:05.929739+00:00",
+    "depart_date": "2026-09-10",
+    "price_usd": 182.0,
+    "return_date": "2026-09-18",
+    "route": "TLV-ROM",
+    "score": 8
+  },
   "0a0b5f12bb209944": {
     "alerted_at": "2026-05-25T02:10:03.068881+00:00"
   },
@@ -51,6 +59,14 @@
     "return_date": "2026-09-19",
     "route": "TLV-ROM",
     "score": 8
+  },
+  "39268840ce3f8eb2": {
+    "alerted_at": "2026-05-28T01:53:13.853867+00:00",
+    "depart_date": "2026-06-27",
+    "price_usd": 165.0,
+    "return_date": "2026-07-05",
+    "route": "TLV-BUD",
+    "score": 9
   },
   "3d8000a374d5bdee": {
     "alerted_at": "2026-05-27T21:43:54.848441+00:00",
