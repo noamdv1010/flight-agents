@@ -6,7 +6,7 @@ currency: USD
 min_score: 8                 # only alert when LLM scores deal >= this (1-10)
 trip_length_days: [3, 14]    # min, max trip length the scanner will sample (≥3 days = ≥2 nights)
 date_window_days: 120        # how far out (days) to scan departures
-samples_per_destination: 2   # number of (depart,return) pairs to sample per dest per run
+samples_per_destination: 5   # (depart,return) pairs per dest per run — biased toward long weekends
 cabin_class: economy         # economy | premium_economy | business | first
 adults: 1
 

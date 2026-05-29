@@ -80,7 +80,10 @@ FX_TO_USD_DEFAULTS: dict[str, float] = {
 }
 
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
-STATE_TTL_DAYS = 14
+STATE_TTL_DAYS = 14                  # how long to remember individual alerts (dedup)
+PRICE_HISTORY_TTL_DAYS = 60          # how long to keep raw price observations per route
+PRICE_HISTORY_MAX_PER_ROUTE = 300    # hard cap so state.json doesn't balloon
+MIN_BASELINE_SAMPLES = 6             # don't trust a baseline computed from fewer than this
 
 logging.basicConfig(
     level=logging.INFO,
@@ -177,46 +180,59 @@ def load_config() -> Config:
     )
 
 
-def load_state() -> dict[str, dict[str, Any]]:
-    """Load state.json. Migrates legacy string-only entries into the rich
-    dict-shape used by the relative-scoring logic.
+def _default_state() -> dict[str, Any]:
+    return {"alerts": {}, "price_history": {}}
 
-    New entry shape:
-        {
-          "alerted_at": "<ISO timestamp>",
-          "route": "TLV-ATH",
-          "price_usd": 220.0,
-          "score": 8,
-          "depart_date": "2026-08-15",
-          "return_date": "2026-08-22"
-        }
+
+def load_state() -> dict[str, Any]:
+    """Load state.json. Returns {'alerts': {...}, 'price_history': {...}}.
+
+    Handles three legacy formats automatically:
+      v1: {fingerprint: "<timestamp>"}                                # earliest
+      v2: {fingerprint: {alerted_at, route, price_usd, score, ...}}    # phase 1
+      v3: {"alerts": {...}, "price_history": {"TLV-ATH": [...]}}      # current
     """
     if not STATE_PATH.exists():
-        return {}
+        return _default_state()
     try:
         raw = json.loads(STATE_PATH.read_text())
     except json.JSONDecodeError:
         log.warning("state.json corrupt, starting fresh")
-        return {}
-    migrated: dict[str, dict[str, Any]] = {}
+        return _default_state()
+    if not isinstance(raw, dict):
+        return _default_state()
+
+    # --- v3: already nested ---
+    if "alerts" in raw or "price_history" in raw:
+        alerts_in = raw.get("alerts", {}) if isinstance(raw.get("alerts"), dict) else {}
+        history_in = raw.get("price_history", {}) if isinstance(raw.get("price_history"), dict) else {}
+        # still run alerts-entry migration in case a v1 string slipped in
+        alerts: dict[str, dict[str, Any]] = {}
+        for k, v in alerts_in.items():
+            if isinstance(v, str):
+                alerts[k] = {"alerted_at": v}
+            elif isinstance(v, dict) and "alerted_at" in v:
+                alerts[k] = v
+        return {"alerts": alerts, "price_history": history_in}
+
+    # --- v1/v2: flat dict of fingerprints — promote to v3 ---
+    alerts = {}
     for k, v in raw.items():
         if isinstance(v, str):
-            # legacy entry: just the timestamp, no route/price/score history.
-            migrated[k] = {"alerted_at": v}
+            alerts[k] = {"alerted_at": v}
         elif isinstance(v, dict) and "alerted_at" in v:
-            migrated[k] = v
-        # silently drop anything malformed
-    return migrated
+            alerts[k] = v
+    return {"alerts": alerts, "price_history": {}}
 
 
-def save_state(state: dict[str, dict[str, Any]]) -> None:
+def save_state(state: dict[str, Any]) -> None:
     STATE_PATH.write_text(json.dumps(state, indent=2, sort_keys=True, ensure_ascii=False))
 
 
-def prune_state(state: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+def prune_alerts(alerts: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
     cutoff = datetime.now(timezone.utc) - timedelta(days=STATE_TTL_DAYS)
     out: dict[str, dict[str, Any]] = {}
-    for k, v in state.items():
+    for k, v in alerts.items():
         ts = v.get("alerted_at")
         if not ts:
             continue
@@ -228,8 +244,65 @@ def prune_state(state: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return out
 
 
+def prune_price_history(history: dict[str, list[dict[str, Any]]]) -> dict[str, list[dict[str, Any]]]:
+    """Drop observations older than PRICE_HISTORY_TTL_DAYS and cap list size per route."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=PRICE_HISTORY_TTL_DAYS)
+    out: dict[str, list[dict[str, Any]]] = {}
+    for route, entries in history.items():
+        if not isinstance(entries, list):
+            continue
+        kept = []
+        for e in entries:
+            ts = e.get("ts")
+            if not ts:
+                continue
+            try:
+                if datetime.fromisoformat(ts) > cutoff:
+                    kept.append(e)
+            except ValueError:
+                continue
+        if kept:
+            # keep most-recent N observations to bound state size
+            out[route] = kept[-PRICE_HISTORY_MAX_PER_ROUTE:]
+    return out
+
+
+def record_price_observation(
+    history: dict[str, list[dict[str, Any]]],
+    deal: FlightDeal,
+) -> None:
+    """Append a price observation for this route. We record EVERYTHING we see —
+    even prices above the user's ceiling — because the baseline needs the full
+    distribution to be meaningful."""
+    route = f"{deal.origin}-{deal.destination}"
+    history.setdefault(route, []).append({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "depart": deal.depart_date,
+        "return": deal.return_date,
+        "price_usd": round(deal.price_usd, 2),
+    })
+
+
+def compute_baseline(prices: list[float]) -> dict[str, Any] | None:
+    """Return summary stats for a route's recent price observations.
+    Returns None if there isn't enough data to be trustworthy.
+    """
+    clean = [p for p in prices if isinstance(p, (int, float)) and p > 0]
+    if len(clean) < MIN_BASELINE_SAMPLES:
+        return None
+    s = sorted(clean)
+    n = len(s)
+    return {
+        "median_usd": round(s[n // 2], 0),
+        "p25_usd": round(s[n // 4], 0),
+        "min_usd": round(s[0], 0),
+        "max_usd": round(s[-1], 0),
+        "samples": n,
+    }
+
+
 def recent_alerts_for_route(
-    state: dict[str, dict[str, Any]],
+    alerts: dict[str, dict[str, Any]],
     origin: str,
     destination: str,
     limit: int = 5,
@@ -241,7 +314,7 @@ def recent_alerts_for_route(
     """
     route = f"{origin}-{destination}"
     matches = [
-        v for v in state.values()
+        v for v in alerts.values()
         if v.get("route") == route and "price_usd" in v
     ]
     matches.sort(key=lambda x: float(x.get("price_usd", 9e9)))
@@ -388,10 +461,16 @@ def search_flights(
 
 
 def sample_date_pairs(cfg: Config, seed_salt: str) -> list[tuple[str, str]]:
-    """Pick N (depart, return) pairs across the rolling window.
+    """Pick N (depart, return) pairs biased toward how Israelis actually travel.
 
-    Uses a seed derived from today + destination so each destination gets a
-    different sample but the same destination on the same day is stable.
+    Distribution per call (roughly):
+      ~55% long weekend  — Thu/Fri depart, 3-5 nights (Sat/Sun/Mon return)
+      ~25% short trip    — any weekday depart, 3-6 nights
+      ~20% week+         — any weekday depart, 7-14 nights (sabbaticals, holidays)
+
+    The seed comes from today + destination so each destination gets a stable
+    but distinct sample on a given day. That keeps the scan deterministic
+    within the day yet rotates across days.
     """
     rng = random.Random(f"{datetime.now(timezone.utc).date()}|{seed_salt}")
     today = datetime.now(timezone.utc).date()
@@ -404,16 +483,37 @@ def sample_date_pairs(cfg: Config, seed_salt: str) -> list[tuple[str, str]]:
     min_trip, max_trip = cfg.trip_length_days
     pairs: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
+
+    def _random_date_in_window() -> "datetime.date":
+        return earliest + timedelta(days=rng.randint(0, span))
+
     attempts = 0
-    while len(pairs) < cfg.samples_per_destination and attempts < 50:
+    while len(pairs) < cfg.samples_per_destination and attempts < 120:
         attempts += 1
-        offset = rng.randint(0, span)
-        trip = rng.randint(min_trip, max_trip)
-        d1 = earliest + timedelta(days=offset)
+
+        r = rng.random()
+        if r < 0.55:
+            # Long weekend: depart Thu(3) or Fri(4), trip 3-5 nights.
+            d1 = _random_date_in_window()
+            target_dow = rng.choice([3, 4])
+            shift = (target_dow - d1.weekday()) % 7
+            d1 = d1 + timedelta(days=shift)
+            trip = rng.randint(3, 5)
+        elif r < 0.80:
+            # Short trip: any weekday, 3-6 nights.
+            d1 = _random_date_in_window()
+            trip = rng.randint(max(3, min_trip), min(6, max_trip))
+        else:
+            # Week+ trip: any weekday, 7-14 nights (capped by config).
+            d1 = _random_date_in_window()
+            trip = rng.randint(min(7, max_trip), max_trip)
+
         d2 = d1 + timedelta(days=trip)
-        if d2 > latest:
+        if d2 > latest or d1 < earliest:
             continue
-        if (d2 - d1).days < 2:          # hard floor: must be at least 2 nights
+        if (d2 - d1).days < 2:                     # hard floor: must be at least 2 nights
+            continue
+        if (d2 - d1).days < min_trip or (d2 - d1).days > max_trip:
             continue
         key = (d1.isoformat(), d2.isoformat())
         if key in seen:
@@ -444,6 +544,16 @@ SCORING_SYSTEM = """אתה מעריך עסקאות טיסה מדוקדק. אתה
   * אורך הנסיעה המתאים לנוסע אמיתי
 
 חלק מהשדות עשויים להיות "לא ידוע". אל תעניש על שדות חסרים; הסתמך יותר על השדות הקיימים, בעיקר מחיר ועצירות.
+
+** בייסליין מחירים אמיתי — הכלל החשוב ביותר: **
+אם מוצג לך "בייסליין מחירים לנתיב הזה" — **אל תנחש** מחיר נורמלי, **השתמש בנתון בפועל**:
+  * המחיר בטווח של החציון (median) או יקר ממנו → 1-5
+  * עד 10% מתחת לחציון → 6
+  * 10%-20% מתחת לחציון → 7
+  * 20%-30% מתחת לחציון → 8
+  * 30%-45% מתחת לחציון → 9
+  * 45%+ מתחת לחציון, או שווה/מתחת ל-min שנראה אי-פעם → 10 (זה דיל אמיתי או טעות מחיר!)
+אם אין בייסליין (פחות מ-6 דגימות), השתמש בידע הכללי שלך אבל היה זהיר ושמרני.
 
 ** דירוג יחסי להיסטוריה — חשוב מאוד: **
 אם מוצגת לך "היסטוריית התראות אחרונות לנתיב הזה", השתמש בה כקו בסיס:
@@ -486,6 +596,7 @@ def score_deal(
     deal: FlightDeal,
     max_price_for_route: float,
     recent_alerts: list[dict[str, Any]] | None = None,
+    baseline: dict[str, Any] | None = None,
 ) -> tuple[int, str]:
     def fmt_min(m: int) -> str:
         return "unknown" if m < 0 else f"{m // 60}h {m % 60}m"
@@ -493,7 +604,22 @@ def score_deal(
     def fmt_stops(s: int) -> str:
         return "unknown" if s < 0 else str(s)
 
-    # Render history so the LLM scores this deal relative to past alerts, not in isolation.
+    # Render a real-data baseline so the LLM doesn't have to guess what "normal" is.
+    baseline_block = ""
+    if baseline:
+        median = baseline["median_usd"]
+        pct_below = ((median - deal.price_usd) / median * 100) if median > 0 else 0
+        baseline_block = (
+            "\n** בייסליין מחירים לנתיב הזה (60 ימים אחרונים):\n"
+            f"  - חציון (median): ${median:.0f}\n"
+            f"  - רבעון תחתון (p25): ${baseline['p25_usd']:.0f}\n"
+            f"  - מינימום שנראה: ${baseline['min_usd']:.0f}\n"
+            f"  - מקסימום שנראה: ${baseline['max_usd']:.0f}\n"
+            f"  - מספר דגימות: {baseline['samples']}\n"
+            f"  - הדיל החדש (${deal.price_usd:.0f}) הוא {pct_below:+.0f}% מתחת לחציון.\n"
+        )
+
+    # Render alerted-history so the LLM scores this deal relative to past alerts, not in isolation.
     history_block = ""
     if recent_alerts:
         lines = ["", "היסטוריית התראות אחרונות לנתיב הזה (14 ימים אחרונים, מסודר מהזול ליקר):"]
@@ -519,6 +645,7 @@ def score_deal(
         f"Stops: outbound={fmt_stops(deal.stops_outbound)}, inbound={fmt_stops(deal.stops_inbound)}\n"
         f"Longest single layover: {fmt_min(deal.layover_minutes)}\n"
         f"Carriers: {', '.join(deal.carriers) or 'unknown'}\n"
+        f"{baseline_block}"
         f"{history_block}\n"
         f"Score this deal."
     )
@@ -621,14 +748,18 @@ def format_alert(deal: FlightDeal, score: int, reasoning: str) -> str:
 
 def run(cfg: Config, dry_run: bool) -> None:
     client = Anthropic(api_key=cfg.anthropic_key)
-    state = prune_state(load_state())
+    state = load_state()
+    state["alerts"] = prune_alerts(state["alerts"])
+    state["price_history"] = prune_price_history(state["price_history"])
 
     total_seen = 0
     total_alerted = 0
+    total_skipped_by_baseline = 0
 
     for dest_cfg in cfg.destinations:
         dest_code = dest_cfg["code"].upper()
         max_price = float(dest_cfg["max_price_usd"])
+        route_key = f"{cfg.origin}-{dest_code}"
         log.info("=== %s -> %s (ceiling $%.0f) ===", cfg.origin, dest_code, max_price)
 
         candidates: list[FlightDeal] = []
@@ -636,31 +767,60 @@ def run(cfg: Config, dry_run: bool) -> None:
             deals = search_flights(cfg, cfg.origin, dest_code, depart, return_)
             total_seen += len(deals)
             for deal in deals:
+                # Record EVERY observation (even above ceiling) — baseline needs the full distribution.
+                record_price_observation(state["price_history"], deal)
                 if deal.price_usd > max_price:
                     continue
-                if state.get(deal.fingerprint()):
+                if state["alerts"].get(deal.fingerprint()):
                     log.info("  skip already-alerted %s $%.0f", deal.depart_date, deal.price_usd)
                     continue
                 candidates.append(deal)
             # Pacing — Google can rate-limit aggressive scraping.
             time.sleep(2.0)
 
+        # Compute the price baseline AFTER this run's observations are recorded
+        # so even the very first run for a destination starts producing data.
+        route_prices = [e["price_usd"] for e in state["price_history"].get(route_key, [])]
+        baseline = compute_baseline(route_prices)
+        if baseline:
+            log.info("  baseline: median $%.0f, p25 $%.0f, min $%.0f, n=%d",
+                     baseline["median_usd"], baseline["p25_usd"],
+                     baseline["min_usd"], baseline["samples"])
+        else:
+            log.info("  baseline: not yet established (need %d obs, have %d)",
+                     MIN_BASELINE_SAMPLES, len(route_prices))
+
         if not candidates:
             log.info("  no candidates under ceiling")
             continue
 
-        # Score only the cheapest few per destination to control LLM cost.
-        # Pull the recent-alert history for this route ONCE and feed it into
-        # every scoring call so the LLM can compare against the existing baseline.
-        history = recent_alerts_for_route(state, cfg.origin, dest_code)
+        # Pull the alert history for this route ONCE; refresh inside the loop
+        # only when a new alert lands.
+        history = recent_alerts_for_route(state["alerts"], cfg.origin, dest_code)
         if history:
-            log.info("  history for %s: %d recent alerts (cheapest $%.0f)",
-                     dest_code, len(history), min(a["price_usd"] for a in history))
+            log.info("  alerted-history: %d alerts (cheapest $%.0f)",
+                     len(history), min(a["price_usd"] for a in history))
 
         candidates.sort(key=lambda d: d.price_usd)
-        for deal in candidates[:3]:
+
+        # Score up to 3 candidates, but smartly skip ones that aren't clearly
+        # a deal vs. baseline (saves LLM cost on "meh" prices).
+        scored_count = 0
+        for deal in candidates:
+            if scored_count >= 3:
+                break
+            # Pre-filter: with a strong baseline, anything within 5% of median is not a deal.
+            if baseline and deal.price_usd > baseline["median_usd"] * 0.95:
+                log.info("  skip-by-baseline %s $%.0f (within 5%% of median $%.0f)",
+                         deal.depart_date, deal.price_usd, baseline["median_usd"])
+                total_skipped_by_baseline += 1
+                continue
             try:
-                score, reasoning = score_deal(client, deal, max_price, recent_alerts=history)
+                score, reasoning = score_deal(
+                    client, deal, max_price,
+                    recent_alerts=history, baseline=baseline,
+                )
+                scored_count += 1
             except Exception as e:
                 log.warning("scoring failed for %s %s: %s", dest_code, deal.depart_date, e)
                 continue
@@ -672,21 +832,21 @@ def run(cfg: Config, dry_run: bool) -> None:
                     log.info("  [DRY-RUN] would alert:\n%s", msg)
                 else:
                     send_telegram(cfg, msg)
-                state[deal.fingerprint()] = {
+                state["alerts"][deal.fingerprint()] = {
                     "alerted_at": datetime.now(timezone.utc).isoformat(),
-                    "route": f"{deal.origin}-{deal.destination}",
+                    "route": route_key,
                     "price_usd": round(deal.price_usd, 2),
                     "score": score,
                     "depart_date": deal.depart_date,
                     "return_date": deal.return_date,
                 }
-                # Future deals in THIS same run for the same destination should
-                # also see this alert as part of their baseline.
-                history = recent_alerts_for_route(state, cfg.origin, dest_code)
+                # Refresh so deals later in this run see this alert in the baseline.
+                history = recent_alerts_for_route(state["alerts"], cfg.origin, dest_code)
                 total_alerted += 1
 
     save_state(state)
-    log.info("done. %d itineraries seen, %d alerts sent.", total_seen, total_alerted)
+    log.info("done. %d itineraries seen, %d alerts sent, %d skipped by baseline.",
+             total_seen, total_alerted, total_skipped_by_baseline)
 
 
 def force_alert(cfg: Config) -> None:
