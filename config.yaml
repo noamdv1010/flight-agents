@@ -62,3 +62,13 @@ destinations:
 
   # Major hub on the Europe/Asia bridge (Turkey accepts Israeli passport holders)
   - { code: IST, max_price_usd: 250 }   # Istanbul (Turkey)
+
+  # Greek islands — direct seasonal flights, very popular Israeli vacation routes.
+  # Ceilings tightened below European mainland because peak-season package deals
+  # (טיסה + מלון) start around $270 — so flight-only must clearly beat that.
+  - { code: HER, max_price_usd: 220 }   # Heraklion (Crete East — main airport)
+  - { code: CHQ, max_price_usd: 220 }   # Chania (Crete West)
+  - { code: RHO, max_price_usd: 220 }   # Rhodes
+  - { code: CFU, max_price_usd: 240 }   # Corfu
+  - { code: JTR, max_price_usd: 260 }   # Santorini (premium island)
+  - { code: JMK, max_price_usd: 260 }   # Mykonos (premium island)
