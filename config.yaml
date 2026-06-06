@@ -72,3 +72,8 @@ destinations:
   - { code: CFU, max_price_usd: 240 }   # Corfu
   - { code: JTR, max_price_usd: 260 }   # Santorini (premium island)
   - { code: JMK, max_price_usd: 260 }   # Mykonos (premium island)
+
+  # Balkans — short flights from TLV, beautiful coast/mountains, still relatively
+  # underrated by Israeli mass tourism → real deal potential.
+  - { code: TIV, max_price_usd: 230 }   # Tivat (Montenegro — Kotor Bay gateway, beach/mountains)
+  - { code: TGD, max_price_usd: 220 }   # Podgorica (Montenegro — capital, year-round flights)
