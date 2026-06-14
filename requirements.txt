@@ -1,4 +1,4 @@
 anthropic>=0.40.0
 requests>=2.31.0
 PyYAML>=6.0
-fast-flights>=2.2
+fast-flights==2.2     # pinned: 3.0 refactored exports and broke our imports
