@@ -2,7 +2,7 @@ name: flight-scan
 
 on:
   schedule:
-    - cron: "0 */4 * * *"        # every 4 hours, UTC
+    - cron: "0 */6 * * *"        # every 6 hours, UTC — 4 runs/day to stay within GitHub Actions free tier
   workflow_dispatch:              # allow manual trigger from the Actions tab
 
 permissions:
