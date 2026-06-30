@@ -4,3 +4,6 @@ __pycache__/
 *.pyc
 .DS_Store
 airport_cache.json
+
+# Local-only Claude handoff notes — must NEVER be pushed (contains personal context)
+CLAUDE.md
